@@ -1,36 +1,47 @@
-#/usr/bin/env bash
+#!/usr/bin/env bash
 
+# get list of regions
 export REGIONS=$(aws ec2 describe-regions | jq -r ".Regions[].RegionName")
+
+# function to process a region
+process_region() {
+    local region="$1"
+    echo "Processing region $region"
+
+    # get default VPC ID
+    local vpc_id=$(aws --region="$region" ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
+
+    # get list of IGWs attached to the default VPC
+    local igw_ids=$(aws --region="$region" ec2 describe-internet-gateways --filters Name=attachment.vpc-id,Values="$vpc_id" --query "InternetGateways[].InternetGatewayId" --output text)
+
+    # detach and delete IGWs
+    for igw_id in $igw_ids; do
+        echo "Detaching and deleting IGW $igw_id in region $region"
+        aws --region="$region" ec2 detach-internet-gateway --internet-gateway-id="$igw_id" --vpc-id="$vpc_id"
+        aws --region="$region" ec2 delete-internet-gateway --internet-gateway-id="$igw_id"
+    done
+
+    # get list of subnet IDs in the default VPC
+    local subnet_ids=$(aws --region="$region" ec2 describe-subnets --filters Name=vpc-id,Values="$vpc_id" --query "Subnets[].SubnetId" --output text)
+
+    # delete subnets
+    for subnet_id in $subnet_ids; do
+        echo "Deleting subnet $subnet_id in region $region"
+        aws --region="$region" ec2 delete-subnet --subnet-id="$subnet_id"
+    done
+
+    # delete default VPC
+    if [ "$vpc_id" == "None" ]; then
+      echo "No default VPC found"
+    else
+      echo "Deleting default VPC in region $region"
+      aws --region="$region" ec2 delete-vpc --vpc-id="$vpc_id"
+    fi
+}
 
 for region in $REGIONS; do
     # list vpcs
     echo $region
-    aws --region=$region ec2 describe-vpcs | jq ".Vpcs[]|{is_default: .IsDefault, cidr: .CidrBlock, id: .VpcId} | select(.is_default)"
-done
-
-for region in $REGIONS ; do
-    echo "Killing $region"
-    # list vpcs
-    export IDs=$(aws --region=$region ec2 describe-vpcs | jq -r ".Vpcs[]|{is_default: .IsDefault, id: .VpcId} | select(.is_default) | .id")
-    for id in "$IDs" ; do
-        if [ -z "$id" ] ; then
-            continue
-        fi
-
-        # kill igws
-        for igw in `aws --region=$region ec2 describe-internet-gateways | jq -r ".InternetGateways[] | {id: .InternetGatewayId, vpc: .Attachments[0].VpcId} | select(.vpc == \"$id\") | .id"` ; do
-            echo "Killing igw $region $id $igw"
-            aws --region=$region ec2 detach-internet-gateway --internet-gateway-id=$igw --vpc-id=$id
-            aws --region=$region ec2 delete-internet-gateway --internet-gateway-id=$igw
-        done
-
-        # kill subnets
-        for sub in `aws --region=$region ec2 describe-subnets | jq -r ".Subnets[] | {id: .SubnetId, vpc: .VpcId} | select(.vpc == \"$id\") | .id"` ; do
-            echo "Killing subnet $region $id $sub"
-            aws --region=$region ec2 delete-subnet --subnet-id=$sub
-        done
-
-        echo "Killing vpc $region $id"
-        aws --region=$region ec2 delete-vpc --vpc-id=$id
-    done
+    process_region $region
+    echo
 done
